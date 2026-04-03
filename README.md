@@ -4,7 +4,7 @@
 
 ## Description
 
-**MiroEval** is an ORS environment for evaluating deep research agents on their ability to conduct web-based research and produce comprehensive reports. It is based on the [MiroEval benchmark](https://arxiv.org/abs/2603.28407) by MiroMindAI, which evaluates multimodal deep research systems across synthesis quality, factual correctness, and process quality dimensions.
+**MiroEval** is an environment for evaluating deep research agents on their ability to conduct web-based research and produce comprehensive reports. It is based on the [MiroEval benchmark](https://arxiv.org/abs/2603.28407) by MiroMindAI, which evaluates multimodal deep research systems across synthesis quality, factual correctness, and process quality dimensions.
 
 This environment implements the **point-wise quality evaluation** pipeline from the original benchmark. Agents receive a research query — optionally with image, PDF, or document attachments — use web search and URL fetching tools to gather information, and submit a comprehensive research report. The report is graded using a 5-stage hierarchical LLM pipeline (GPT-5.1) that dynamically generates query-specific evaluation dimensions, criteria, and scores. For multimodal tasks, grading includes attachment-grounded key facts extraction and grounding-aware scoring.
 
