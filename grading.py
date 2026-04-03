@@ -5,6 +5,7 @@ Implements the 5-stage hierarchical evaluation from the original MiroEval:
 https://github.com/MiroMindAI/MiroEval/blob/main/point_quality/deepresearcharena/evaluator/pointwise_core.py
 
 Uses GPT-5.1 as the judge model (faithful to original configuration).
+Supports both text-only and multimodal (attachment-aware) grading.
 """
 
 import asyncio
@@ -15,10 +16,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import openai
 
 from prompts import (
+    KEY_FACTS_EXTRACTION_PROMPT,
     DIMENSION_GENERATION_PROMPT,
+    DIMENSION_GENERATION_WITH_ATTACHMENT_PROMPT,
     WEIGHT_GENERATION_PROMPT,
     CRITERIA_GENERATION_PROMPT,
+    CRITERIA_GENERATION_WITH_KEY_FACTS_PROMPT,
     SCORING_PROMPT,
+    SCORING_WITH_KEY_FACTS_PROMPT,
 )
 from utils import extract_json_from_response, extract_json_from_analysis_output
 
@@ -37,6 +42,7 @@ class PointwiseGrader:
     """
     Implements the MiroEval 5-stage point-wise quality grading pipeline.
 
+    Stage 0 (multimodal only): Extract key facts from attachments
     Stage 1: Generate 1-3 query-specific dimensions
     Stage 2: Assign normalized weights (query-specific <= 20%)
     Stage 3: Generate criteria per dimension with weights
@@ -68,15 +74,106 @@ class PointwiseGrader:
                     await asyncio.sleep(wait)
         raise last_error  # type: ignore
 
+    async def _call_llm_with_image(self, prompt: str, image_base64: str, mime_type: str, max_retries: int = 3) -> str:
+        """Call LLM with an image (vision API). Used for image-based key facts extraction."""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{image_base64}",
+                                },
+                            },
+                        ],
+                    }],
+                    max_completion_tokens=4096,
+                    temperature=0.1,
+                )
+                return response.choices[0].message.content or ""
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    logger.warning(f"Vision LLM call failed (attempt {attempt+1}): {e}, retrying in {wait}s")
+                    await asyncio.sleep(wait)
+        raise last_error  # type: ignore
+
+    # ── Stage 0: Extract key facts from attachments (multimodal only) ──
+
+    async def extract_key_facts(
+        self, task_prompt: str, attachment_contents: List[Dict[str, str]]
+    ) -> List[Dict[str, str]]:
+        """
+        Extract key facts from attachment contents. Each attachment is either:
+        - {"text": "..."} for text/PDF content
+        - {"image_base64": "...", "mime_type": "..."} for images
+
+        Faithful to original: each attachment processed independently, results merged.
+        Returns list of {"fact": "...", "importance": "..."}.
+        """
+        all_key_facts: List[Dict[str, str]] = []
+
+        for i, content in enumerate(attachment_contents):
+            logger.info(f"Extracting key facts from attachment {i+1}/{len(attachment_contents)}")
+            try:
+                if "text" in content:
+                    # Text-based attachment (PDF text, text files)
+                    formatted_prompt = KEY_FACTS_EXTRACTION_PROMPT.format(
+                        task_prompt=task_prompt,
+                        attachment_content=content["text"],
+                    )
+                    response = await self._call_llm(formatted_prompt)
+                elif "image_base64" in content:
+                    # Image attachment — use vision API
+                    formatted_prompt = KEY_FACTS_EXTRACTION_PROMPT.format(
+                        task_prompt=task_prompt,
+                        attachment_content="[See attached image]",
+                    )
+                    response = await self._call_llm_with_image(
+                        formatted_prompt,
+                        content["image_base64"],
+                        content.get("mime_type", "image/jpeg"),
+                    )
+                else:
+                    continue
+
+                json_str = extract_json_from_response(response)
+                if json_str:
+                    facts = json.loads(json_str)
+                    if isinstance(facts, list):
+                        all_key_facts.extend(facts)
+                        logger.info(f"Extracted {len(facts)} key facts from attachment {i+1}")
+            except Exception as e:
+                logger.error(f"Failed to extract key facts from attachment {i+1}: {e}")
+
+        logger.info(f"Total key facts extracted: {len(all_key_facts)}")
+        return all_key_facts
+
     # ── Stage 1: Generate query-specific dimensions ──
 
-    async def generate_query_dimensions(self, task_prompt: str) -> List[Dict[str, str]]:
+    async def generate_query_dimensions(
+        self, task_prompt: str, key_facts: Optional[List[Dict[str, str]]] = None
+    ) -> List[Dict[str, str]]:
         """
         Generate 1-3 query-specific evaluation dimensions.
-        Returns list of {"meta_dimension_name": "...", "definition": "..."}.
-        Falls back to empty list on failure.
+        Uses attachment-aware prompt when key_facts are provided.
         """
-        formatted_prompt = DIMENSION_GENERATION_PROMPT.format(task_prompt=task_prompt)
+        if key_facts:
+            key_facts_json = json.dumps(key_facts, ensure_ascii=False, indent=2)
+            formatted_prompt = DIMENSION_GENERATION_WITH_ATTACHMENT_PROMPT.format(
+                task_prompt=task_prompt,
+                key_facts_json=key_facts_json,
+            )
+        else:
+            formatted_prompt = DIMENSION_GENERATION_PROMPT.format(task_prompt=task_prompt)
+
         try:
             response = await self._call_llm(formatted_prompt)
             json_str = extract_json_from_response(response)
@@ -111,12 +208,9 @@ class PointwiseGrader:
             weights_json = extract_json_from_analysis_output(response)
             if weights_json:
                 weights = json.loads(weights_json)
-                # Normalize to sum to 1.0
                 total_weight = sum(weights.values())
                 if total_weight > 0:
                     weights = {k: v / total_weight for k, v in weights.items()}
-
-                # Convert dimension names to snake_case (matches original)
                 normalized = {}
                 for k, v in weights.items():
                     key = k.lower().replace(" ", "_").replace("-", "_")
@@ -145,22 +239,33 @@ class PointwiseGrader:
         task_prompt: str,
         dimension_name: str,
         all_dims_with_definition: Dict[str, str],
+        key_facts: Optional[List[Dict[str, str]]] = None,
+        is_dynamic_dim: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Generate evaluation criteria for a single dimension.
-        Each criterion has: criterion (str), explanation (str), weight (float).
-        Weights normalized to sum to 1.0.
-        Retries up to 2 times, falls back to default criteria.
+        Uses key-facts-aware prompt for dynamic dimensions with attachments.
         """
         meta_dims_str = "\n".join(
             f"- **{dim}**: {defn}" for dim, defn in all_dims_with_definition.items()
         )
-        formatted_prompt = CRITERIA_GENERATION_PROMPT.format(
-            task_prompt=task_prompt,
-            num_dimensions=len(all_dims_with_definition),
-            meta_dimensions=meta_dims_str,
-            dimension_name=dimension_name,
-        )
+
+        if key_facts and is_dynamic_dim:
+            key_facts_json = json.dumps(key_facts, ensure_ascii=False, indent=2)
+            formatted_prompt = CRITERIA_GENERATION_WITH_KEY_FACTS_PROMPT.format(
+                task_prompt=task_prompt,
+                num_dimensions=len(all_dims_with_definition),
+                meta_dimensions=meta_dims_str,
+                dimension_name=dimension_name,
+                key_facts_json=key_facts_json,
+            )
+        else:
+            formatted_prompt = CRITERIA_GENERATION_PROMPT.format(
+                task_prompt=task_prompt,
+                num_dimensions=len(all_dims_with_definition),
+                meta_dimensions=meta_dims_str,
+                dimension_name=dimension_name,
+            )
 
         for attempt in range(2):
             try:
@@ -169,7 +274,6 @@ class PointwiseGrader:
                 if json_str:
                     parsed = json.loads(json_str)
                     if isinstance(parsed, list) and len(parsed) > 0:
-                        # Normalize weights to sum to 1.0
                         total_w = sum(item.get("weight", 0) for item in parsed)
                         if total_w > 0:
                             for item in parsed:
@@ -211,10 +315,12 @@ class PointwiseGrader:
         report: str,
         dim_name: str,
         criteria_list: List[Dict[str, Any]],
+        key_facts: Optional[List[Dict[str, str]]] = None,
+        is_dynamic_dim: bool = False,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
-        Score a report on a single dimension. Returns (dim_name, scored_criteria_list).
-        Retries up to 3 times on JSON parse failure.
+        Score a report on a single dimension.
+        Uses key-facts-aware scoring for dynamic dimensions with attachments.
         """
         criteria_for_prompt = [
             {"criterion": c["criterion"], "explanation": c["explanation"]}
@@ -222,11 +328,20 @@ class PointwiseGrader:
         ]
         criteria_json = json.dumps(criteria_for_prompt, ensure_ascii=False, indent=2)
 
-        formatted_prompt = SCORING_PROMPT.format(
-            task_prompt=task_prompt,
-            report=report,
-            criteria_of_one_dimension_json=criteria_json,
-        )
+        if key_facts and is_dynamic_dim:
+            key_facts_json = json.dumps(key_facts, ensure_ascii=False, indent=2)
+            formatted_prompt = SCORING_WITH_KEY_FACTS_PROMPT.format(
+                task_prompt=task_prompt,
+                report=report,
+                criteria_of_one_dimension_json=criteria_json,
+                key_facts_json=key_facts_json,
+            )
+        else:
+            formatted_prompt = SCORING_PROMPT.format(
+                task_prompt=task_prompt,
+                report=report,
+                criteria_of_one_dimension_json=criteria_json,
+            )
 
         max_retries = 3
         last_error = None
@@ -239,7 +354,6 @@ class PointwiseGrader:
                     raise ValueError("No JSON found in scoring response")
                 scored = json.loads(json_str)
 
-                # Build response mapping by criterion text
                 resp_map = {item["criterion"]: item for item in scored}
                 dimension_scores = []
                 for c in criteria_list:
@@ -268,10 +382,6 @@ class PointwiseGrader:
     ) -> Dict[str, Any]:
         """
         Calculate final hierarchical weighted scores.
-
-        If a dimension's scoring failed (empty/missing scores), it is excluded
-        and its weight is redistributed proportionally among successful dimensions.
-
         Faithful to original MiroEval calculate_hierarchical_scores.
         """
         final_scores: Dict[str, Any] = {}
@@ -315,7 +425,6 @@ class PointwiseGrader:
             final_scores[f"{dim_name}_score"] = final_dim_score
             dim_score_map[dim_name] = final_dim_score
 
-        # Redistribute weights: exclude failed dimensions
         if failed_dims:
             logger.warning(f"Dimensions with failed scoring (excluded): {failed_dims}")
 
@@ -334,26 +443,38 @@ class PointwiseGrader:
 
     # ── Full Pipeline ──
 
-    async def grade_report(self, task_prompt: str, report: str) -> Dict[str, Any]:
+    async def grade_report(
+        self,
+        task_prompt: str,
+        report: str,
+        attachment_contents: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, Any]:
         """
-        Run the full 5-stage grading pipeline.
+        Run the full grading pipeline.
 
-        Returns dict with:
-          - total_score: float (0-10)
-          - dimension_scores: dict of dimension -> score
-          - dimension_weights: dict of dimension -> weight
-          - all_criteria: dict of dimension -> list of criteria
-          - additional_dimensions: list of generated dimensions
-          - raw_scores: dict of dimension -> list of scored criteria
+        Args:
+            task_prompt: The research query
+            report: The agent's submitted report
+            attachment_contents: Optional list of attachment content dicts for multimodal tasks.
+                Each is {"text": "..."} or {"image_base64": "...", "mime_type": "..."}.
         """
+        # Stage 0: Extract key facts (multimodal only)
+        key_facts: Optional[List[Dict[str, str]]] = None
+        if attachment_contents:
+            key_facts = await self.extract_key_facts(task_prompt, attachment_contents)
+            if not key_facts:
+                key_facts = None  # Treat as text-only if extraction failed
+
         # Stage 1: Generate query-specific dimensions
-        additional_dimensions = await self.generate_query_dimensions(task_prompt)
+        additional_dimensions = await self.generate_query_dimensions(task_prompt, key_facts)
 
-        # Build complete dimension map
+        # Build complete dimension map; track which are dynamic
         all_dims: Dict[str, str] = dict(FIXED_DIMENSIONS)
+        dynamic_dim_names: set[str] = set()
         for item in additional_dimensions:
             key = item["meta_dimension_name"].lower().replace(" ", "_").replace("-", "_")
             all_dims[key] = item["definition"]
+            dynamic_dim_names.add(key)
 
         # Stage 2: Generate weights
         dimension_weights = await self.generate_hierarchical_weights(
@@ -362,7 +483,11 @@ class PointwiseGrader:
 
         # Stage 3: Generate criteria for ALL dimensions concurrently
         criteria_tasks = [
-            self.generate_dimension_criteria(task_prompt, dim_name, all_dims)
+            self.generate_dimension_criteria(
+                task_prompt, dim_name, all_dims,
+                key_facts=key_facts,
+                is_dynamic_dim=(dim_name in dynamic_dim_names),
+            )
             for dim_name in all_dims
         ]
         criteria_results = await asyncio.gather(*criteria_tasks)
@@ -370,12 +495,15 @@ class PointwiseGrader:
 
         # Stage 4: Score ALL dimensions concurrently
         scoring_tasks = [
-            self.score_single_dimension(task_prompt, report, dim_name, criteria)
+            self.score_single_dimension(
+                task_prompt, report, dim_name, criteria,
+                key_facts=key_facts,
+                is_dynamic_dim=(dim_name in dynamic_dim_names),
+            )
             for dim_name, criteria in all_criteria.items()
         ]
         scoring_results = await asyncio.gather(*scoring_tasks, return_exceptions=True)
 
-        # Collect scores, handle failures
         scores: Dict[str, List[Dict]] = {}
         for result in scoring_results:
             if isinstance(result, Exception):
@@ -388,7 +516,6 @@ class PointwiseGrader:
         final = self.calculate_hierarchical_scores(scores, all_criteria, dimension_weights)
         total_score = final.get("total_weighted_score", 0.0)
 
-        # Build dimension_scores dict for metadata
         dim_scores_out = {}
         for key, val in final.items():
             if key.endswith("_score") and key != "total_weighted_score":
@@ -404,4 +531,5 @@ class PointwiseGrader:
             },
             "raw_scores": scores,
             "additional_dimensions": additional_dimensions,
+            "key_facts": key_facts,
         }

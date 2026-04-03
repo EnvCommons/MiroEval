@@ -2,3 +2,5 @@ openai
 openreward
 python-dotenv
 tavily-python
+pdfplumber
+pdf2image

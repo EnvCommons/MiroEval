@@ -4,56 +4,108 @@ from pathlib import Path
 from typing import Optional
 
 
-def load_tasks() -> tuple[list[dict], dict[str, dict]]:
-    """
-    Load MiroEval text queries.
-
-    Tries /orwd_data/mirobench_text.json first (production),
-    falls back to local data/mirobench_text.json (development).
-
-    Returns:
-        tasks: list of user-facing task specs (id, query, domain, language)
-        full_tasks: dict keyed by id with full annotation data
-    """
+def _find_data_file(filename: str) -> Optional[Path]:
+    """Find a data file in production or local paths."""
     candidates = [
-        Path("/orwd_data/mirobench_text.json"),
-        Path(__file__).parent / "data" / "mirobench_text.json",
+        Path("/orwd_data") / filename,
+        Path(__file__).parent / "data" / filename,
     ]
-
-    raw = None
     for path in candidates:
         if path.exists():
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            break
+            return path
+    return None
 
-    if raw is None:
-        raise FileNotFoundError(
-            f"mirobench_text.json not found. Searched: {[str(p) for p in candidates]}"
-        )
 
+def _find_attachments_dir() -> Optional[Path]:
+    """Find the multimodal-attachments directory."""
+    candidates = [
+        Path("/orwd_data/multimodal-attachments"),
+        Path(__file__).parent / "data" / "multimodal-attachments",
+    ]
+    for path in candidates:
+        if path.is_dir():
+            return path
+    return None
+
+
+def load_tasks() -> tuple[list[dict], dict[str, dict]]:
+    """
+    Load all MiroEval queries (text + multimodal) into a single 'test' split.
+
+    Returns:
+        tasks: list of user-facing task specs
+        full_tasks: dict keyed by id with full annotation data
+    """
     tasks = []
     full_tasks = {}
 
-    for item in raw:
+    # Load text queries (70)
+    text_path = _find_data_file("mirobench_text.json")
+    if text_path is None:
+        raise FileNotFoundError("mirobench_text.json not found")
+    with open(text_path, "r", encoding="utf-8") as f:
+        text_raw = json.load(f)
+
+    for item in text_raw:
         task_id = str(item["id"])
         annotation = item.get("annotation", {})
-
         task_spec = {
             "id": task_id,
             "query": item["rewritten_query"],
             "domain": annotation.get("domain", "other"),
             "language": annotation.get("language", "en"),
+            "files": [],
         }
         tasks.append(task_spec)
-
         full_tasks[task_id] = {
             **task_spec,
             "chat_id": item.get("chat_id", ""),
             "annotation": annotation,
         }
 
+    # Load multimodal queries (30)
+    mm_path = _find_data_file("mirobench_multimodal.json")
+    if mm_path is not None:
+        with open(mm_path, "r", encoding="utf-8") as f:
+            mm_raw = json.load(f)
+
+        for item in mm_raw:
+            task_id = str(item["id"])
+            annotation = item.get("annotation", {})
+            files = item.get("files", [])
+            task_spec = {
+                "id": task_id,
+                "query": item["rewritten_query"],
+                "domain": annotation.get("domain", "other"),
+                "language": annotation.get("language", "en"),
+                "files": [
+                    {
+                        "filename": f["filename"],
+                        "type": f.get("type", "unknown"),
+                        "dir": f.get("dir", ""),
+                    }
+                    for f in files
+                ],
+            }
+            tasks.append(task_spec)
+            full_tasks[task_id] = {
+                **task_spec,
+                "chat_id": item.get("chat_id", ""),
+                "annotation": annotation,
+            }
+
     return tasks, full_tasks
+
+
+def resolve_attachment_path(task_id: str, filename: str) -> Optional[Path]:
+    """Resolve the full path to an attachment file."""
+    attachments_dir = _find_attachments_dir()
+    if attachments_dir is None:
+        return None
+    path = attachments_dir / task_id / filename
+    if path.exists():
+        return path
+    return None
 
 
 def extract_json_from_response(text: str) -> Optional[str]:

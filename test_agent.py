@@ -32,7 +32,7 @@ async def main():
     MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-5.2")
     ENV_NAME = "GeneralReasoning/miroeval"
     BASE_URL = "http://localhost:8085"
-    SPLIT = "text"
+    SPLIT = "test"
     N_TASKS = int(os.environ.get("N_TASKS", "1"))
     MAX_TURNS = 30
     START_TASK = int(os.environ.get("START_TASK", "0"))
