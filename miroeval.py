@@ -19,7 +19,7 @@ import openai
 from pydantic import BaseModel, Field
 from tavily import AsyncTavilyClient
 
-from openreward.environments import Environment, ImageBlock, JSONObject, TextBlock, ToolOutput, tool
+from openreward.environments import Environment, ImageBlock, JSONObject, TextBlock, ToolOutput, terminal, tool
 
 from grading import PointwiseGrader
 from utils import load_tasks, resolve_attachment_path
@@ -64,13 +64,12 @@ CHINESE_INSTRUCTIONS = """您的任务是对以下研究问题进行深入调查
 1. web_search(query: str) - 搜索网络信息，返回标题、URL和摘要
 2. fetch_url(url: str) - 获取特定URL的完整内容
 3. view_attachment(filename: str) - 查看附件文件（图片、PDF等）
-4. submit_report(report: str) - 提交最终研究报告（结束任务）
 
 说明:
 1. 如果有附件，先使用 view_attachment 查看附件内容
 2. 使用 web_search 查找相关信息，从不同角度搜索以全面覆盖
 3. 使用 fetch_url 获取有价值URL的完整内容
-4. 准备好后，使用 submit_report 提交您的研究报告
+4. 准备好后，请直接以普通消息形式回复您的完整研究报告（不要调用任何工具）。您的整条回复将作为报告进行评分——请避免开场白和结束语。
 
 重要提示: 这个问题需要深入研究。请充分调查后再提交报告。"""
 
@@ -80,13 +79,12 @@ Available Tools:
 1. web_search(query: str) - Search for information, returns titles, URLs, and snippets
 2. fetch_url(url: str) - Fetch full content from a specific URL
 3. view_attachment(filename: str) - View an attachment file (images, PDFs, etc.)
-4. submit_report(report: str) - Submit your final research report (ends the task)
 
 Instructions:
 1. If attachments are provided, start by viewing them with view_attachment
 2. Use web_search to find relevant information from multiple angles
 3. Use fetch_url to get complete content from promising URLs
-4. When ready, use submit_report with your comprehensive research report
+4. When ready, reply with your comprehensive research report as an ordinary message (no tool call). Your entire reply is graded as the report, so avoid preamble and closing remarks.
 
 Important: This question requires thorough research. Investigate fully before submitting."""
 
@@ -370,9 +368,10 @@ class MiroEval(Environment):
 
     # ── Report submission + grading ──
 
+    @terminal
     @tool
     async def submit_report(self, params: ReportInput) -> ToolOutput:
-        """Submit your final research report for evaluation."""
+        """Grade the assistant's final message as a research report."""
         result = await self.grader.grade_report(
             task_prompt=self.validated.query,
             report=params.report,
