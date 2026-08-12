@@ -1,6 +1,6 @@
 """Test agent for MiroEval (terminal-tool style).
 
-Multi-turn deep research: web_search / fetch_url / view_attachment, then reply
+Multi-turn deep research: web_search / web_fetch / view_attachment, then reply
 with the final report as a plain-text message. The @terminal grader (gpt-5.1)
 scores the whole reply on multiple quality dimensions.
 
@@ -28,9 +28,11 @@ def _text_of(response) -> str:
 
 async def main():
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    # Optional: whichever the server's OPENREWARD_SEARCH_BACKEND needs.
     TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-    if not OPENAI_API_KEY or not TAVILY_API_KEY:
-        raise ValueError("OPENAI_API_KEY and TAVILY_API_KEY required")
+    OPENREWARD_API_KEY = os.getenv("OPENREWARD_API_KEY")
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY required")
 
     MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-5.2")
     ENV_NAME = os.environ.get("ENV_NAME", "GeneralReasoning/MiroEval")
@@ -69,7 +71,9 @@ async def main():
 
         async with environment.session(
             task=task,
-            secrets={"openai_api_key": OPENAI_API_KEY, "tavily_api_key": TAVILY_API_KEY},
+            secrets={"openai_api_key": OPENAI_API_KEY,
+                     **({"tavily_api_key": TAVILY_API_KEY} if TAVILY_API_KEY else {}),
+                     **({"api_key": OPENREWARD_API_KEY} if OPENREWARD_API_KEY else {})},
         ) as session:
             assistant_ends_rollout = await session.is_assistant_message_final()
             session_tools = await session.list_tools()

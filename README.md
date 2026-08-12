@@ -59,7 +59,7 @@ Queries are sourced from the [MiroEval benchmark](https://github.com/MiroMindAI/
 Agents are given three visible tools:
 
 - `web_search`: Search the web for information. Returns titles, URLs, and snippets. Uses Tavily API with advanced search depth.
-- `fetch_url`: Fetch full text content from a URL. Content truncated at 12,000 characters.
+- `web_fetch`: Fetch full text content from a URL. Content truncated at 12,000 characters.
 - `view_attachment`: View an attachment file associated with the task. Images are returned as visual content. PDFs are rendered page-by-page as images. Text files are returned as text.
 
 Grading uses a hidden `@terminal` tool: when the agent is done researching, it replies with the final report as an ordinary message. The whole reply is graded by a `gpt-5.1` pointwise judge across multiple quality dimensions.

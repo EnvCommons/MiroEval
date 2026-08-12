@@ -1,6 +1,5 @@
 openai
-openreward
+openreward[search]>=0.1.153
 python-dotenv
-tavily-python
 pdfplumber
 pdf2image

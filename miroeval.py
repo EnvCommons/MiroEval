@@ -17,9 +17,9 @@ from typing import List, Optional, Union
 
 import openai
 from pydantic import BaseModel, Field
-from tavily import AsyncTavilyClient
 
 from openreward.environments import Environment, ImageBlock, JSONObject, TextBlock, ToolOutput, terminal, tool
+from openreward.toolsets import WebToolset
 
 from grading import PointwiseGrader
 from utils import load_tasks, resolve_attachment_path
@@ -35,14 +35,6 @@ class TaskSpec(BaseModel):
     domain: str
     language: str
     files: list[dict] = []
-
-
-class WebSearchInput(BaseModel, extra="forbid"):
-    query: str = Field(..., description="Search query string")
-
-
-class FetchUrlInput(BaseModel, extra="forbid"):
-    url: str = Field(..., description="URL to fetch content from")
 
 
 class ViewAttachmentInput(BaseModel, extra="forbid"):
@@ -62,13 +54,13 @@ CHINESE_INSTRUCTIONS = """您的任务是对以下研究问题进行深入调查
 
 可用工具:
 1. web_search(query: str) - 搜索网络信息，返回标题、URL和摘要
-2. fetch_url(url: str) - 获取特定URL的完整内容
+2. web_fetch(url: str) - 获取特定URL的完整内容
 3. view_attachment(filename: str) - 查看附件文件（图片、PDF等）
 
 说明:
 1. 如果有附件，先使用 view_attachment 查看附件内容
 2. 使用 web_search 查找相关信息，从不同角度搜索以全面覆盖
-3. 使用 fetch_url 获取有价值URL的完整内容
+3. 使用 web_fetch 获取有价值URL的完整内容
 4. 准备好后，请直接以普通消息形式回复您的完整研究报告（不要调用任何工具）。您的整条回复将作为报告进行评分——请避免开场白和结束语。
 
 重要提示: 这个问题需要深入研究。请充分调查后再提交报告。"""
@@ -77,13 +69,13 @@ ENGLISH_INSTRUCTIONS = """Your task is to conduct in-depth research on the quest
 
 Available Tools:
 1. web_search(query: str) - Search for information, returns titles, URLs, and snippets
-2. fetch_url(url: str) - Fetch full content from a specific URL
+2. web_fetch(url: str, prompt: str) - Fetch the content of a specific URL
 3. view_attachment(filename: str) - View an attachment file (images, PDFs, etc.)
 
 Instructions:
 1. If attachments are provided, start by viewing them with view_attachment
 2. Use web_search to find relevant information from multiple angles
-3. Use fetch_url to get complete content from promising URLs
+3. Use web_fetch to get complete content from promising URLs
 4. When ready, reply with your comprehensive research report as an ordinary message (no tool call). Your entire reply is graded as the report, so avoid preamble and closing remarks.
 
 Important: This question requires thorough research. Investigate fully before submitting."""
@@ -142,6 +134,19 @@ class MiroEval(Environment):
     Reference: https://arxiv.org/abs/2603.28407
     """
 
+    # web_search / web_fetch come from the SDK rather than being hand-rolled here.
+    # Which provider answers is process configuration (OPENREWARD_SEARCH_BACKEND,
+    # default "backsearch"), so changing search provider needs no change here.
+    #
+    # The toolset owns the error split too: an unfetchable page stays tool output
+    # the agent can act on, while a missing key or exhausted quota raises so the
+    # rollout ends with a blank reward rather than a score that reads as a bad answer.
+    toolsets = [WebToolset]
+
+    # Search hits keep their snippets, as the prompt promises. Off in the SDK by
+    # default, which would force a fetch per candidate just to triage results.
+    web_include_snippets = True
+
     def __init__(self, task_spec: JSONObject, secrets: dict[str, str] = {}) -> None:
         super().__init__(task_spec)
         self.validated = TaskSpec.model_validate(task_spec)
@@ -150,18 +155,16 @@ class MiroEval(Environment):
         if not openai_api_key:
             raise ValueError(
                 "openai_api_key required in secrets for LLM grading. "
-                "Pass secrets={'openai_api_key': '...', 'tavily_api_key': '...'}"
+                "Pass secrets={'openai_api_key': '...'}"
             )
 
-        tavily_api_key = secrets.get("tavily_api_key")
-        if not tavily_api_key:
-            raise ValueError(
-                "tavily_api_key required in secrets for web search. "
-                "Pass secrets={'openai_api_key': '...', 'tavily_api_key': '...'}"
-            )
+        # Read live by WebToolset on every tool call, so the search backend takes its
+        # credentials from the session rather than the server process. The configured
+        # backend picks the key it needs: `api_key` for backsearch, `tavily_api_key`
+        # for tavily. No up-front check — which key is required depends on the backend.
+        self.search_secrets = secrets
 
         self.openai_client = openai.AsyncClient(api_key=openai_api_key)
-        self.tavily_client = AsyncTavilyClient(api_key=tavily_api_key)
         self.grader = PointwiseGrader(client=self.openai_client, model="gpt-5.1")
 
         # Pre-load attachment content for grading (text representations)
@@ -231,78 +234,6 @@ class MiroEval(Environment):
         return ["test"]
 
     # ── Web tools ──
-
-    @tool
-    async def web_search(self, params: WebSearchInput) -> ToolOutput:
-        """Search the web for information. Returns titles, URLs, and snippets."""
-        try:
-            response = await self.tavily_client.search(
-                query=params.query,
-                search_depth="advanced",
-                max_results=8,
-            )
-            results = response.get("results", [])
-            if not results:
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text="No search results found.")],
-                    metadata={"query": params.query, "results": []},
-                    reward=0.0,
-                    finished=False,
-                )
-
-            display_parts = [f"Search results for: {params.query}\n"]
-            for i, result in enumerate(results, 1):
-                title = result.get("title", "No title")
-                url = result.get("url", "")
-                snippet = result.get("content", "")
-                display_parts.append(f"{i}. {title}\n   URL: {url}\n   {snippet}\n")
-
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text="\n".join(display_parts))],
-                metadata={"query": params.query, "results": results, "count": len(results)},
-                reward=0.0,
-                finished=False,
-            )
-        except Exception as e:
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Web search failed: {e}")],
-                metadata={"query": params.query, "error": str(e)},
-                reward=0.0,
-                finished=False,
-            )
-
-    @tool
-    async def fetch_url(self, params: FetchUrlInput) -> ToolOutput:
-        """Fetch full text content from a URL."""
-        try:
-            response = await self.tavily_client.extract(urls=[params.url])
-            results = response.get("results", [])
-            if not results:
-                return ToolOutput(
-                    blocks=[TextBlock(type="text", text=f"No content extracted from {params.url}")],
-                    metadata={"url": params.url, "results": []},
-                    reward=0.0,
-                    finished=False,
-                )
-
-            raw_content = results[0].get("raw_content", "")
-            max_length = 12000
-            if len(raw_content) > max_length:
-                raw_content = raw_content[:max_length] + "...\n[Content truncated]"
-
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Content from {params.url}:\n\n{raw_content}")],
-                metadata={"url": params.url, "length": len(raw_content)},
-                reward=0.0,
-                finished=False,
-            )
-        except Exception as e:
-            return ToolOutput(
-                blocks=[TextBlock(type="text", text=f"Failed to fetch URL: {e}")],
-                metadata={"url": params.url, "error": str(e)},
-                reward=0.0,
-                finished=False,
-            )
 
     # ── Attachment viewing ──
 

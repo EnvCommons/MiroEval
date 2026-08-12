@@ -7,7 +7,7 @@ Categories:
 3. Aggregation (no LLM)
 4. Default Fallbacks (no LLM)
 5. Environment Class (no LLM)
-6. Integration Tests (require LLM + Tavily, marked @pytest.mark.integration)
+6. Integration Tests (require LLM + a search credential, marked @pytest.mark.integration)
 """
 
 import json
@@ -313,16 +313,19 @@ class TestEnvironmentClass:
 
     def test_environment_missing_openai_secret(self):
         with pytest.raises(ValueError, match="openai_api_key"):
-            MiroEval(task_spec=self._text_task(), secrets={"tavily_api_key": "tvly-xxx"})
+            MiroEval(task_spec=self._text_task(), secrets={})
 
-    def test_environment_missing_tavily_secret(self):
-        with pytest.raises(ValueError, match="tavily_api_key"):
-            MiroEval(task_spec=self._text_task(), secrets={"openai_api_key": "sk-xxx"})
+    def test_environment_needs_no_search_secret(self):
+        """Search credentials are resolved per tool call by WebToolset, not at
+        construction, and which key is needed depends on the configured backend —
+        so a missing one must not fail session creation."""
+        env = MiroEval(task_spec=self._text_task(), secrets={"openai_api_key": "sk-xxx"})
+        assert env.search_secrets == {"openai_api_key": "sk-xxx"}
 
     def test_environment_init_text_task(self):
         env = MiroEval(
             task_spec=self._text_task(),
-            secrets={"openai_api_key": "sk-test", "tavily_api_key": "tvly-test"},
+            secrets={"openai_api_key": "sk-test"},
         )
         assert not env._is_multimodal
         assert env.attachment_contents == []
@@ -330,7 +333,7 @@ class TestEnvironmentClass:
     def test_environment_init_multimodal_task(self):
         env = MiroEval(
             task_spec=self._mm_task(),
-            secrets={"openai_api_key": "sk-test", "tavily_api_key": "tvly-test"},
+            secrets={"openai_api_key": "sk-test"},
         )
         assert env._is_multimodal
         # attachment_contents may be empty if files not on disk yet
@@ -339,7 +342,7 @@ class TestEnvironmentClass:
     async def test_prompt_contains_query(self):
         env = MiroEval(
             task_spec=self._text_task(),
-            secrets={"openai_api_key": "sk-test", "tavily_api_key": "tvly-test"},
+            secrets={"openai_api_key": "sk-test"},
         )
         blocks = await env.get_prompt()
         assert len(blocks) >= 1
@@ -349,7 +352,7 @@ class TestEnvironmentClass:
     async def test_prompt_multimodal_lists_attachments(self):
         env = MiroEval(
             task_spec=self._mm_task(),
-            secrets={"openai_api_key": "sk-test", "tavily_api_key": "tvly-test"},
+            secrets={"openai_api_key": "sk-test"},
         )
         blocks = await env.get_prompt()
         text = blocks[0].text
@@ -377,7 +380,7 @@ class TestEnvironmentClass:
     async def test_view_attachment_invalid_filename(self):
         env = MiroEval(
             task_spec=self._mm_task(),
-            secrets={"openai_api_key": "sk-test", "tavily_api_key": "tvly-test"},
+            secrets={"openai_api_key": "sk-test"},
         )
         result = await env.view_attachment(ViewAttachmentInput(filename="nonexistent.jpg"))
         assert result.finished is False
@@ -420,7 +423,7 @@ class TestIntegration:
     async def test_fetch_url_returns_content(self):
         secrets = _get_secrets()
         env = MiroEval(task_spec=_integration_task, secrets=secrets)
-        result = await env.fetch_url(FetchUrlInput(url="https://en.wikipedia.org/wiki/Python_(programming_language)"))
+        result = await env.web_fetch(FetchUrlInput(url="https://en.wikipedia.org/wiki/Python_(programming_language)"))
         assert result.finished is False
         assert result.reward == 0.0
 
